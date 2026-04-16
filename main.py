@@ -9,12 +9,16 @@ if _raw_host.startswith("0.0.0.0"):
 
 import chromadb
 import ollama
+from sentence_transformers import CrossEncoder
 
-DATA_FILE = "Data/hdss_synthetic_50.jsonl"
-EMBED_MODEL = "nomic-embed-text:latest"
-LLM_MODEL = "gemma3:4b"
-N_SEMANTIC = 5   # top-k from semantic search
-N_KEYWORD  = 5   # max docs added by keyword matching
+DATA_FILE    = "Data/hdss_synthetic_50.jsonl"
+EMBED_MODEL  = "nomic-embed-text:latest"
+LLM_MODEL    = "gemma3:4b"
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+N_SEMANTIC   = 10   # candidates from semantic search  (wider net before reranking)
+N_KEYWORD    = 10   # candidates added via keyword match
+N_FINAL      = 5    # top docs to keep after reranking
 
 
 class OllamaEmbeddingFunction(chromadb.utils.embedding_functions.EmbeddingFunction):
@@ -34,9 +38,7 @@ class OllamaEmbeddingFunction(chromadb.utils.embedding_functions.EmbeddingFuncti
 
 
 def load_data(file_path):
-    documents = []
-    metadata = []
-    ids = []
+    documents, metadata, ids = [], [], []
 
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -70,8 +72,8 @@ def load_data(file_path):
     return documents, metadata, ids
 
 
-def keyword_search(query: str, all_docs: list[str], all_ids: list[str], max_results: int) -> list[tuple[str, str]]:
-    """Return (id, doc) pairs whose text contains any word from the query (case-insensitive, min 4 chars)."""
+def keyword_search(query: str, all_docs: list, all_ids: list, max_results: int) -> list:
+    """Return (id, doc) pairs whose text contains any query word (case-insensitive, min 4 chars)."""
     words = [w.lower() for w in query.split() if len(w) >= 4]
     hits = []
     for doc_id, doc in zip(all_ids, all_docs):
@@ -81,6 +83,16 @@ def keyword_search(query: str, all_docs: list[str], all_ids: list[str], max_resu
         if len(hits) >= max_results:
             break
     return hits
+
+
+def rerank(query: str, docs: list, reranker: CrossEncoder, top_n: int) -> list:
+    """Score each (query, doc) pair with the cross-encoder and return top_n docs."""
+    if not docs:
+        return docs
+    pairs  = [(query, doc) for doc in docs]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in ranked[:top_n]]
 
 
 def get_ollama_client():
@@ -101,7 +113,7 @@ def main():
 
     print("Initializing ChromaDB and encoding documents...")
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
-    embed_fn = OllamaEmbeddingFunction(model_name=EMBED_MODEL)
+    embed_fn      = OllamaEmbeddingFunction(model_name=EMBED_MODEL)
 
     collection = chroma_client.get_or_create_collection(
         name="hdss_population",
@@ -121,9 +133,14 @@ def main():
     else:
         print(f"Database already contains {collection.count()} records. Skipping re-embedding.")
 
+    print(f"Loading reranker ({RERANK_MODEL})...")
+    reranker = CrossEncoder(RERANK_MODEL)
+    print("Reranker ready.")
+
     print("\n--- Command Line RAG Ready ---")
-    print(f"Using Embedder: {EMBED_MODEL}")
-    print(f"Using LLM:      {LLM_MODEL}")
+    print(f"Embedder : {EMBED_MODEL}")
+    print(f"Reranker : {RERANK_MODEL}")
+    print(f"LLM      : {LLM_MODEL}")
     print("Type 'exit' or 'quit' to stop.\n")
 
     ollama_client = get_ollama_client()
@@ -140,30 +157,32 @@ def main():
         if not query.strip():
             continue
 
-        # --- Hybrid retrieval ---
+        # --- Stage 1: Hybrid retrieval (cast a wide net) ---
         print("[Retrieving...]", end="", flush=True)
 
-        # 1. Semantic search
         sem_results = collection.query(query_texts=[query], n_results=N_SEMANTIC)
-        sem_docs = sem_results["documents"][0] if sem_results["documents"] else []
-        sem_ids  = sem_results["ids"][0]       if sem_results["ids"]       else []
+        sem_docs    = sem_results["documents"][0] if sem_results["documents"] else []
+        sem_ids     = sem_results["ids"][0]       if sem_results["ids"]       else []
 
-        # 2. Keyword search over all loaded documents
         kw_hits = keyword_search(query, documents, ids, max_results=N_KEYWORD)
 
-        # 3. Merge: keyword hits first (most likely exact matches), then semantic, deduped
-        seen = set(sem_ids)
-        merged_docs = list(sem_docs)
+        seen        = set(sem_ids)
+        candidates  = list(sem_docs)
         for doc_id, doc in kw_hits:
             if doc_id not in seen:
-                merged_docs.insert(0, doc)   # prepend so they appear early in context
+                candidates.append(doc)
                 seen.add(doc_id)
 
-        print(f" Done. ({len(merged_docs)} docs: {len(sem_docs)} semantic + {len(merged_docs)-len(sem_docs)} keyword)\n")
+        print(f" {len(candidates)} candidates.", end="", flush=True)
 
-        context = "\n\n".join(merged_docs)
+        # --- Stage 2: Rerank and keep top N_FINAL ---
+        print(" [Reranking...]", end="", flush=True)
+        final_docs = rerank(query, candidates, reranker, top_n=N_FINAL)
+        print(f" Done. ({N_FINAL} docs kept)\n")
 
-        # --- Build prompt ---
+        context = "\n\n".join(final_docs)
+
+        # --- Stage 3: Generate ---
         system_prompt = (
             "You are a helpful assistant analyzing demographic health survey data. "
             "Use ONLY the records provided in the context below to answer the question. "
@@ -173,7 +192,6 @@ def main():
             f"Context:\n{context}"
         )
 
-        # --- Generate ---
         print("[Generating answer...]")
         messages = [
             {"role": "system", "content": system_prompt},

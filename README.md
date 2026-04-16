@@ -11,18 +11,22 @@ All inference runs fully offline via [Ollama](https://ollama.com) — no cloud A
 ```
 User Query
   ↓
-Hybrid Retrieval
-  ├── Semantic search  (ChromaDB + nomic-embed-text)
-  └── Keyword search   (exact word matching on all records)
+Stage 1 — Hybrid Retrieval (wide net)
+  ├── Semantic search  (ChromaDB + nomic-embed-text)  →  10 candidates
+  └── Keyword search   (exact word matching)           →  up to 10 more
   ↓
-Top ~10 most relevant records sent as context
+Stage 2 — Reranking
+  └── CrossEncoder (ms-marco-MiniLM-L-6-v2) scores each candidate
+      and keeps the top 5
   ↓
-Local LLM (gemma3:4b via Ollama) generates answer
+Stage 3 — Generation
+  └── Local LLM (gemma3:4b via Ollama) answers using the 5 best docs
   ↓
 Streamed response
 ```
 
-The hybrid retrieval strategy ensures both conceptual queries ("who migrated for health reasons?") and name-specific lookups ("what is the date of birth for Miriam Kirunda?") return accurate results.
+- **Hybrid retrieval** ensures both conceptual queries ("who migrated for health reasons?") and name-specific lookups ("date of birth for Miriam Kirunda?") surface the right candidates.
+- **Reranking** re-scores every candidate against the exact query using a cross-encoder, so only the most relevant docs reach the LLM — reducing noise and hallucination.
 
 ---
 
@@ -30,7 +34,7 @@ The hybrid retrieval strategy ensures both conceptual queries ("who migrated for
 
 ### Python packages
 ```bash
-pip install chromadb ollama
+pip install chromadb ollama sentence-transformers
 ```
 
 ### Ollama models
@@ -102,9 +106,11 @@ Key constants in `main.py`:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `EMBED_MODEL` | `nomic-embed-text:latest` | Ollama embedding model |
+| `RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | HuggingFace cross-encoder for reranking |
 | `LLM_MODEL` | `gemma3:4b` | Ollama chat model |
-| `N_SEMANTIC` | `5` | Documents retrieved via semantic search |
-| `N_KEYWORD` | `5` | Documents added via keyword matching |
+| `N_SEMANTIC` | `10` | Candidate docs from semantic search |
+| `N_KEYWORD` | `10` | Candidate docs added via keyword matching |
+| `N_FINAL` | `5` | Docs kept after reranking (sent to LLM) |
 | `DATA_FILE` | `Data/hdss_synthetic_50.jsonl` | Input data path |
 
 ---
@@ -121,4 +127,4 @@ Key constants in `main.py`:
 - **Narrative-based embeddings** — `Data/Narative Data/hdss_synthetic_50_narratives.jsonl` contains full prose descriptions for each record (migration history, household context, observation events). Switching the pipeline to embed these narratives instead of the structured field format would improve semantic retrieval quality, especially for open-ended conceptual queries.
 - **Larger dataset support** — extend ingestion to handle thousands of records with chunking and metadata filtering.
 - **Web UI** — add a Gradio or Streamlit front-end for non-technical users.
-- **Reranking** — add a cross-encoder reranker step between retrieval and generation for higher answer accuracy.
+- ~~**Reranking** — add a cross-encoder reranker step between retrieval and generation for higher answer accuracy.~~ ✅ Done
